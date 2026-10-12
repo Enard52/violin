@@ -22,6 +22,7 @@ import yaml
 
 from ..core.commands.targets import (
     KNOWN_FILE_EXTENSIONS,
+    _host_in_scope_data,
     extract_target_candidates,
     normalize_target,
     resolve_target,
@@ -144,6 +145,15 @@ _DYNAMIC_EXECUTION_CALLS = frozenset(
         "urlopen",
     }
 )
+
+
+def _load_scope_data(eng_dir: str | Path) -> dict:
+    """Return the parsed scope.yaml for an engagement, or {} when it is absent."""
+    scope_path = state.resolve_eng_dir(str(eng_dir)) / "scope" / "scope.yaml"
+    if not scope_path.exists():
+        return {}
+    with scope_path.open(encoding="utf-8") as handle:
+        return yaml.safe_load(handle) or {}
 
 
 def _resolve_target(eng_dir: str) -> str:
@@ -270,6 +280,7 @@ def validate_source(source: object) -> tuple[dict[str, str] | None, str | None]:
     if gate.errors:
         return None, "execute_code blocked by Violin guard: " + "; ".join(gate.errors)
     declared = normalize_target(metadata["target"])
+    scope_data = _load_scope_data(eng_dir)
     foreign: dict[str, int] = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
@@ -281,8 +292,12 @@ def validate_source(source: object) -> tuple[dict[str, str] | None, str | None]:
             continue  # Identifier-shaped text is not a network endpoint.
         for candidate in extract_target_candidates(f"probe {value}"):
             normalized = normalize_target(candidate)
-            if normalized not in {declared, "localhost", "127.0.0.1", "0.0.0.0", "::", "::1"}:
-                foreign.setdefault(normalized, node.lineno)
+            if normalized in {declared, "localhost", "127.0.0.1", "0.0.0.0", "::", "::1"}:
+                continue
+            # A literal covered by an in-scope CIDR/range is in scope, not foreign.
+            if scope_data and _host_in_scope_data(scope_data, normalized):
+                continue
+            foreign.setdefault(normalized, node.lineno)
     if foreign:
         located = ", ".join(f"{target} (line {line})" for target, line in sorted(foreign.items()))
         return None, (
