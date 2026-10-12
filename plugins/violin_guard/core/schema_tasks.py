@@ -28,12 +28,21 @@ class RecordPttArgsModel(BaseModel):
             "'[-]' (cancelled), '[!]' (blocked). Must be a literal bracket token (not 'in_progress')."
         ),
     )
-    note: str = ""
+    note: str = Field(
+        ..., description="Non-empty lifecycle note describing this start, review, or close"
+    )
     skill: str = Field(..., description="Selected Violin skill required before task activation")
     technique: str = Field(..., description="Concrete technique required before task activation")
     hypothesis_id: str = Field("", description="Required for hypothesis-driven phases")
     title: str = Field("", description="Required when explicitly creating a new PTT task")
     phase: str = Field("", description="Phase for an explicitly created PTT task")
+
+    @field_validator("note", mode="after")
+    @classmethod
+    def _non_blank_note(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("task id and non-empty lifecycle note required")
+        return value
 
 
 class RecordHypothesisArgsModel(BaseModel):

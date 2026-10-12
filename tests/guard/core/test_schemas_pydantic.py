@@ -208,7 +208,13 @@ def test_review_payload_contract():
 
 
 def test_ptt_payload_rejects_batch_review_fields():
-    required = {"eng_dir": "eng", "id": "PT-001", "skill": "pentest", "technique": "recon"}
+    required = {
+        "eng_dir": "eng",
+        "id": "PT-001",
+        "skill": "pentest",
+        "technique": "recon",
+        "note": "started",
+    }
     model = schemas.RecordPttArgsModel.model_validate(required)
     assert model.status == ""
     for field in (
