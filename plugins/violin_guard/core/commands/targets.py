@@ -435,7 +435,7 @@ def resolve_target(
         target_val = unique[0]
     elif host_query:
         normalized_host = normalize_target(host_query)
-        if normalized_host not in scope_hosts(scope_data):
+        if not _host_in_scope_data(scope_data, normalized_host):
             if scope_path is not None and not _is_ip_network(normalized_host):
                 raise ValueError(
                     _unknown_hostname_diagnostic(
@@ -449,12 +449,22 @@ def resolve_target(
     else:
         raw_values = [
             value.strip()
-            for key in ("ip_addresses", "urls", "in_scope_urls", "domains", "hostnames", "roles")
+            for key in (
+                "ip_addresses",
+                "cidrs",
+                "ranges",
+                "urls",
+                "in_scope_urls",
+                "domains",
+                "hostnames",
+                "roles",
+            )
             for value in _values(targets_sec.get(key, []))
             if value.strip()
         ]
         by_host: dict[str, str] = {}
-        for value in raw_values:
+        raw_values_kept = _collapse_covered_networks(raw_values)
+        for value in raw_values_kept:
             by_host.setdefault(normalize_target(value), value)
         if len(by_host) > 1:
             raise ValueError("multiple targets are in scope; select one with host or role")
@@ -649,6 +659,25 @@ def scope_hosts(scope: dict[str, Any], section: str = "targets") -> set[str]:
     return {normalize_target(value) for key in keys for value in _values(values.get(key, []))}
 
 
+def _host_in_scope_data(scope: dict[str, Any], host: str) -> bool:
+    """Return True when ``host`` is a listed host, wildcard, or CIDR/range member.
+
+    Mirrors the command-time policy: exclusions win, and an address inside an
+    in-scope CIDR or range is in scope even when it is not listed individually.
+    """
+    if not host:
+        return False
+    in_scope = _matches_host(host, scope_hosts(scope)) or _matches_ip_set(
+        host, _scope_ip_set(scope, "targets")
+    )
+    if not in_scope:
+        return False
+    excluded = _matches_host(host, scope_hosts(scope, "exclusions")) or _matches_ip_set(
+        host, _scope_ip_set(scope, "exclusions")
+    )
+    return not excluded
+
+
 def _scope_ip_set(scope: dict[str, Any], section: str) -> netaddr.IPSet:
     values = scope.get(section, {}) or {}
     ip_set = netaddr.IPSet()
@@ -701,6 +730,28 @@ def _is_ip_network(value: str) -> bool:
         netaddr.IPNetwork(value)
         return True
     return False
+
+
+def _collapse_covered_networks(raw_values: list[str]) -> list[str]:
+    """Drop a CIDR/range entry when a plain address it contains is also listed.
+
+    A covering network and the address inside it are one declared target; the
+    more specific plain address is kept, which is what ``resolve_target``
+    returned before CIDR members were considered.
+    """
+    plain_addresses = [
+        netaddr.IPAddress(value)
+        for value in raw_values
+        if "/" not in value and _is_ip_network(value)
+    ]
+    kept: list[str] = []
+    for value in raw_values:
+        if "/" in value and _is_ip_network(value):
+            network = netaddr.IPNetwork(value)
+            if any(address in network for address in plain_addresses):
+                continue
+        kept.append(value)
+    return kept
 
 
 def resolve_command_targets(
