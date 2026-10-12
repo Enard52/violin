@@ -175,8 +175,9 @@ def parse_metadata(source: object) -> tuple[dict[str, str] | None, str | None]:
         try:
             target = _resolve_target(raw["eng_dir"])
             session_id = state.resolve_session_id(raw["eng_dir"])
-        except Exception:
-            return None, _HEADER_ERROR
+        except Exception as exc:
+            cause = str(exc).strip()
+            return None, _HEADER_ERROR + (f" Cause: {cause}" if cause else "")
         if not target or not session_id:
             return None, _HEADER_ERROR
         raw["target"] = target

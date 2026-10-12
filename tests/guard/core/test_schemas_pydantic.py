@@ -178,7 +178,13 @@ def test_record_hypothesis_accepts_evidence_paths_and_merges_runtime_evidence():
     [
         (
             schemas.RecordPttArgsModel,
-            {"eng_dir": "eng", "id": "PT-001", "skill": "pentest", "technique": "recon"},
+            {
+                "eng_dir": "eng",
+                "id": "PT-001",
+                "skill": "pentest",
+                "technique": "recon",
+                "note": "started",
+            },
             "",
         ),
         (
