@@ -9,7 +9,9 @@ from pathlib import Path
 from plugins.violin_guard.gates import command
 from plugins.violin_guard.gates.command import Phase
 
-_STALE_HYP = """### H-001: Queue service validation
+_STALE_HYP = """## Active Theories
+
+### H-001: Queue service validation
 - **Target:** 10.129.47.140:1515
 - **Status:** Validated
 - **Phase:** EXPLOITATION
@@ -18,7 +20,9 @@ _STALE_HYP = """### H-001: Queue service validation
 - **Updated:** 2026-08-01 10:00
 """
 
-_FRESH_HYP = """### H-001: Queue service validation
+_FRESH_HYP = """## Active Theories
+
+### H-001: Queue service validation
 - **Target:** 10.129.47.140:1515
 - **Status:** Validated
 - **Phase:** EXPLOITATION
@@ -110,11 +114,13 @@ def test_recency_gate_suppressed_during_burst(tmp_path: Path) -> None:
 
 def test_recency_gate_suppressed_when_batch_in_progress(tmp_path: Path) -> None:
     """When a bounded batch is in progress, recency hints must be suppressed."""
-    from plugins.violin_guard.core import state
+    from plugins.violin_guard.core.engagement import state
 
     eng = _make_engagement(tmp_path, _STALE_HYP, evidence_age=2 * 3600)
     # Simulate an active pending sync batch
-    state.mark_pending_sync(eng, "curl http://10.129.47.140/probe", "exploitation", "PT-103")
+    state.commit_execution_start(
+        eng, "curl http://10.129.47.140/probe", "EXPLOITATION", "PT-103", "recency-pending"
+    )
     result = command.check_hypothesis_freshness(
         eng,
         Phase.EXPLOITATION,

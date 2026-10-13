@@ -16,13 +16,13 @@ from typing import Any
 from yarl import URL
 
 from benchmark.python_requests import python_request_observations
-from plugins.violin_guard.core.bash_ast import parse_bash_segments
-from plugins.violin_guard.core.http_observations import (
+from plugins.violin_guard.core.commands.bash_ast import parse_bash_segments
+from plugins.violin_guard.core.evidence.http_observations import (
     HTTP_METHODS,
     parse_http_observations,
     parse_http_statuses,
 )
-from plugins.violin_guard.core.receipt_integrity import verified_evidence_paths
+from plugins.violin_guard.core.evidence.receipt_integrity import verified_evidence_paths
 
 
 @dataclass(frozen=True)
@@ -338,7 +338,10 @@ def _saved_evidence_bundles(
                 not path.is_file()
                 or path.is_symlink()
                 or not path.is_relative_to(trusted_root)
-                or path.suffix.lower() == ".json"
+                or (
+                    path.is_relative_to(trusted_root / "executions")
+                    and path.suffix.lower() == ".json"
+                )
             ):
                 continue
             producing_receipts = [

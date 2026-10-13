@@ -8,31 +8,19 @@ from typing import Any
 
 import yaml
 
-from ..core import findings, history, hypotheses, ptt
-from ..core.redaction import redact_single_line
-
-_CANONICAL_FINDING_OR_HYPOTHESIS_RE = re.compile(r"evidence/|FIND-\d+|H-\d+", re.IGNORECASE)
+from ..core.engagement import hypotheses, ptt
+from ..core.engagement.disposition_policy import (
+    EXPECTED_METHODOLOGY_GATES,
+    evaluate_dispositions,
+)
+from ..core.evidence import findings, history
+from ..core.evidence.redaction import redact_single_line
 
 # A REPORTING close is satisfied by a command that produced authenticated proof of
 # impact: one executed in an exploitation/later phase, or one executed under VULN_RESEARCH
 # with a trusting receipt (validation proof-of-concepts legitimately live there).
 _LATER_PROOF_PHASES = frozenset({"exploitation", "post_exploitation", "privesc", "flags"})
 _VULN_RESEARCH_PHASES = frozenset({"vuln_research", "vuln-research"})
-
-_EXPECTED_METHODOLOGY_GATES = frozenset(
-    {
-        "information-gathering",
-        "configuration-deployment",
-        "authentication-session",
-        "authorization",
-        "input-validation",
-        "error-handling",
-        "cryptography",
-        "business-logic",
-        "client-side",
-        "api-testing",
-    }
-)
 
 
 def _redact_sensitive_note(note: str) -> str:
@@ -45,55 +33,6 @@ def _with_skill_token(note: str, skill: str, digest: str) -> str:
     token = f"[skill:{skill}@{digest}]"
     stripped = re.sub(r"\s*\[skill:[^\]]+\]", "", note).strip()
     return f"{stripped} {token}".strip()
-
-
-def _validate_disposition_entry(name: str, entry: Any) -> list[str]:
-    """Validate a single cell/gate disposition mapping for status and evidence rules."""
-    name_normalized = str(name).strip().lower()
-    if not isinstance(entry, dict):
-        return [f"{name_normalized} (must be a mapping with status and evidence_or_reason)"]
-    status = str(entry.get("status") or "").strip().lower()
-    reason = str(entry.get("evidence_or_reason") or "").strip()
-    if status not in {"tested", "not_applicable", "blocked"} or not reason:
-        return [f"{name_normalized} (status in {{tested, not_applicable, blocked}} + reason)"]
-    if status == "not_applicable" and "evidence/" not in reason:
-        return [f"{name_normalized} (not_applicable without evidence file)"]
-    if status == "blocked" and "guard" not in reason.lower():
-        return [f"{name_normalized} (blocked without guard reference)"]
-    if status == "tested" and not _CANONICAL_FINDING_OR_HYPOTHESIS_RE.search(reason):
-        return [f"{name_normalized} (tested without evidence/FIND/hypothesis reference)"]
-    return []
-
-
-def _coverage_key_errors(entries: Any, obligations: list[Any]) -> list[str]:
-    """Validate coverage-matrix cells against the engagement obligation vocabulary.
-
-    Shared by the VULN_RESEARCH close gate and the bootstrap write path, so an
-    unrecognised obligation key fails immediately and lists the accepted keys.
-    A cell is recognized if its lowercased key or evidence text maps to at least
-    one obligation. Returns error strings; empty means the key mapping is sound.
-    """
-    accepted = {
-        str(obligation).strip().lower()
-        for obligation in (obligations or [])
-        if str(obligation).strip()
-    }
-    if not accepted or not isinstance(entries, dict) or not entries:
-        return []
-    errors: list[str] = []
-    for name, entry in entries.items():
-        cell = (
-            f"{str(name).strip().lower()} "
-            f"{str((entry or {}).get('evidence_or_reason') or '').strip().lower()}"
-            if isinstance(entry, dict)
-            else str(name).strip().lower()
-        )
-        if not any(obligation in cell for obligation in accepted):
-            errors.append(
-                f"{name} (unrecognised obligation key; accepted keys: "
-                f"{', '.join(sorted(accepted))})"
-            )
-    return errors
 
 
 def _validate_phase_exit(engagement: Path, task_id: str, status: str) -> None:
@@ -137,52 +76,49 @@ def _validate_phase_exit(engagement: Path, task_id: str, status: str) -> None:
                     obligations = (scope_data.get("engagement") or {}).get(
                         "coverage_obligations"
                     ) or []
-                    cell_texts = [
-                        f"{str(name).lower()} {str(entry.get('evidence_or_reason') or '').lower()}"
-                        for name, entry in entries.items()
-                        if isinstance(entry, dict)
+                    evaluation = evaluate_dispositions(entries, obligations=obligations)
+                    existing_keys = {str(key).strip().lower() for key in entries}
+                    absent_obligations = [
+                        obligation
+                        for obligation in evaluation.missing_obligations
+                        if obligation not in existing_keys
                     ]
-                    unresolved_coverage: list[str] = []
-                    first_missing: str | None = None
-                    for obligation in obligations:
-                        obligation_str = str(obligation).strip().lower()
-                        if not obligation_str:
-                            continue
-                        if not any(obligation_str in text for text in cell_texts):
-                            if first_missing is None:
-                                first_missing = obligation_str
-                            unresolved_coverage.append(
-                                f"{obligation_str} (no coverage-matrix cell)"
-                            )
-                    for name, entry in entries.items():
-                        unresolved_coverage.extend(_validate_disposition_entry(name, entry))
-                    unresolved_coverage.extend(_coverage_key_errors(entries, obligations))
+                    unresolved_coverage = [
+                        f"{obligation} (no coverage-matrix cell)"
+                        for obligation in absent_obligations
+                    ]
+                    unresolved_coverage.extend(evaluation.entry_errors)
+                    unresolved_coverage.extend(evaluation.unrecognized_entries)
+                    first_missing = next(iter(absent_obligations), None)
                     if unresolved_coverage:
                         hints = [
-                            "how to fix: each obligation must map to a coverage-matrix cell",
-                            "  - matrix keys are the EXACT lowercased obligation strings from scope.yaml",
-                            "    (e.g. 'post /api/v1/auth/login') inside a flat 'coverage:' mapping —",
-                            "    no nested 'routes:' block, no slugified keys",
-                            "  - 'tested' cells: evidence_or_reason must cite evidence/ or a hypothesis id",
-                            "  - 'not_applicable' cells: evidence_or_reason must cite an evidence/ file showing the probe",
-                            "    (run the probe, save its output under evidence/vuln-research/, then reference that path)",
-                            "  - 'blocked' cells: evidence_or_reason must name the guard that prevented testing",
-                            "  - minimal valid cell:",
-                            "      coverage:",
-                            "        'post /api/v1/auth/login':",
-                            "          status: tested",
-                            "          evidence_or_reason: 'evidence/vuln-research/login.txt HTTP status line'",
+                            "how to fix: each obligation needs a coverage-matrix cell",
+                            "  - keys are the EXACT lowercased obligation strings from scope.yaml in a flat",
+                            "    'coverage:' mapping (no 'routes:' block, no slugified keys)",
+                            "  - 'tested' cells: evidence_or_reason cites evidence/ or a hypothesis id",
+                            "  - 'not_applicable' cells: cite the probe artifact; 'blocked' cells: name the guard",
+                            "  - minimal cell: 'post /api/v1/auth/login': {status: tested,",
+                            "    evidence_or_reason: 'evidence/...login.txt HTTP status line'}",
                         ]
-                        message = "undispositioned coverage: " + ", ".join(unresolved_coverage)
+                        shown = unresolved_coverage[:3]
+                        remainder = len(unresolved_coverage) - len(shown)
+                        message = "undispositioned coverage: " + "; ".join(shown)
+                        if remainder:
+                            message += f"; +{remainder} more"
                         if first_missing:
                             message += (
-                                f". First missing obligation: {first_missing} — add a cell keyed by "
-                                "this exact lowercased string"
+                                f". First missing: {first_missing} — use this exact lowercased key"
                             )
                         close_errors.append(message + ". " + " ".join(hints))
 
         unresolved = [
-            f"H-{item.id}" for item in board if item.canonical_status() in {"Candidate", "Likely"}
+            f"H-{item.id}"
+            for item in board
+            if item.canonical_status() == "Candidate"
+            or (
+                item.canonical_status() == "Likely"
+                and not (item.cve_research.strip() and item.exploit_research.strip())
+            )
         ]
         if unresolved:
             close_errors.append("unresolved hypotheses: " + ", ".join(unresolved))
@@ -233,7 +169,7 @@ def _validate_phase_exit(engagement: Path, task_id: str, status: str) -> None:
                             f"authenticate its evidence: {exc}"
                         ) from exc
                     proof_paths.add((engagement / receipt_path).resolve())
-                    proof_paths.update(evidence)
+                    proof_paths.update(evidence.authenticated)
                 reported_proofs[finding_id] = proof_paths
             unreported = []
             for item in validated:
@@ -314,7 +250,7 @@ def _methodology_gate_errors(engagement: Path, scope_data: dict[str, Any]) -> li
     Refactored from _validate_methodology_gates so the phase-exit gate can
     surface ALL missing preconditions in one error instead of one at a time.
     """
-    expected_gates = _EXPECTED_METHODOLOGY_GATES
+    expected_gates = EXPECTED_METHODOLOGY_GATES
     gates_path = engagement / "state" / "methodology-gates.yaml"
     if not gates_path.is_file():
         return [
@@ -338,24 +274,22 @@ def _methodology_gate_errors(engagement: Path, scope_data: dict[str, Any]) -> li
     if not isinstance(entries, dict) or not entries:
         return ["methodology gates must contain a non-empty 'gates:' mapping"]
 
+    evaluation = evaluate_dispositions(entries, required_names=expected_gates)
     errors: list[str] = []
-    missing_gates = expected_gates - {str(key).strip().lower() for key in entries}
-    if missing_gates:
+    if evaluation.missing_required_names:
         errors.append(
             "undispositioned methodology gates: "
-            + ", ".join(sorted(missing_gates))
+            + ", ".join(evaluation.missing_required_names)
             + ". Add each category under a flat 'gates:' mapping (e.g. "
             "'authentication-session:') with status and evidence_or_reason."
         )
-    for name, entry in entries.items():
-        errors.extend(_validate_disposition_entry(name, entry))
+    errors.extend(evaluation.entry_errors)
     return errors
 
 
 __all__ = [
     "_methodology_gate_errors",
     "_redact_sensitive_note",
-    "_validate_disposition_entry",
     "_validate_phase_exit",
     "_with_skill_token",
 ]

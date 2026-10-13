@@ -24,20 +24,49 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     httpx-toolkit \
     dnsx \
     subfinder \
+    wordlists \
+    dirb \
+    ripgrep \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/bin/python
 
+# The small wordlists and DIRB packages provide candidate lists for discovery;
+# the much larger SecLists archive is optional, not baked into the benchmark
+# image. Playbooks must check which paths actually exist before use (#222).
+#
+# Kali ships ProjectDiscovery httpx as `httpx-toolkit` to avoid colliding with
+# the PyPI `httpx` client. That console script lands in /opt/hermes/bin, which
+# precedes /usr/bin on PATH, so a bare `httpx` silently resolved to the wrong
+# tool. Expose the security tool under the name the playbooks use; the Python
+# client stays reachable as `python -m httpx`.
+RUN mkdir -p /root/.local/bin && ln -sf /usr/bin/httpx-toolkit /root/.local/bin/httpx
 
-# Install uv package manager & hermes-agent CLI + violin plugin deps.
-# hermes-agent >=0.16 requires Python <3.14 and Kali rolling now ships 3.14,
-# so system pip cannot resolve it — pin the CLI to an isolated uv-managed
-# Python 3.13 environment instead of the distro python.
+# ripgrep backs Hermes' `search_files` tool (bounded broad search) and is in the
+# guard's read-only command allowlist, so it is provisioned as tooling rather
+# than pulled in as a browser dependency.
+
+# No browser runtime is provisioned here. The previous attempt added nodejs/npm
+# plus a global `agent-browser` install (npm was unpinned, and the download grew
+# the image from 2.56GB to 4.78GB) for a browser whose redirect/subresource
+# scope is not yet enforced (#57) and which was never benchmarked. Do not
+# assume browser tools are absent merely because the CLI is missing: verify
+# runtime registration separately. Revisit provisioning only after #57 lands
+# and the cost and tool exposure are measured.
+
+
+# Install uv and pinned Hermes v0.21.5 into a Python 3.13 environment.
+# The upstream project declares requires-python >=3.11,<3.14; keep the CLI
+# runtime inside that supported range and install the immutable audited source.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:/root/.cargo/bin:/opt/hermes/bin:${PATH}"
 ENV HOME="/root"
-RUN uv venv /opt/hermes --python 3.13 \
+ARG HERMES_TAG=v2026.9.24
+ARG HERMES_COMMIT=f97608f178d1ffeca59860195ab7da295f7c8e5f
+RUN git clone --depth 1 --branch "$HERMES_TAG" https://github.com/NousResearch/hermes-agent.git /opt/hermes-agent \
+    && test "$(git -C /opt/hermes-agent rev-parse HEAD)" = "$HERMES_COMMIT" \
+    && uv venv /opt/hermes --python 3.13 \
     && uv pip install --python /opt/hermes/bin/python \
-        "hermes-agent>=0.18.0,<0.20" \
+        --editable /opt/hermes-agent \
         duckduckgo-search \
         tirith \
         filelock \
@@ -61,7 +90,7 @@ COPY plugins /violin/plugins/
 COPY skills /violin/skills/
 COPY scripts /violin/scripts/
 COPY assets /violin/assets/
-COPY benchmark/run.py /violin/benchmark/run.py
+COPY benchmark/run.py benchmark/engagement.py /violin/benchmark/
 COPY benchmark/targets/duck-store/scope.yaml benchmark/targets/duck-store/engage.md /violin/benchmark/targets/duck-store/
 
 # The image has no tests/ tree (whitelist above), so pytest must not be
@@ -74,7 +103,10 @@ RUN sed -i '/^\[tool\.pytest\.ini_options\]/,$d' /violin/pyproject.toml \
     && ! grep -q 'tool\.pytest' /violin/pyproject.toml
 
 # Install the violin profile into Hermes per official distribution.yaml spec
-RUN hermes profile install /violin --name violin -y
+RUN hermes profile install /violin --name violin -y \
+    && hermes -p violin plugins disable violin_guard \
+    && hermes -p violin plugins enable violin_guard --no-allow-tool-override \
+    && hermes -p violin plugins doctor /root/.hermes/profiles/violin/plugins/violin_guard --ci
 
 # Create home profile link so script paths resolve consistently under Hermes profile execution
 RUN mkdir -p /root/.hermes/profiles/violin/home \

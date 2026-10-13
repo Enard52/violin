@@ -8,7 +8,8 @@ from pathlib import Path
 
 import yaml
 
-from plugins.violin_guard.core import schemas, state
+from plugins.violin_guard.core import schemas
+from plugins.violin_guard.core.engagement import state
 from plugins.violin_guard.engine import release
 from plugins.violin_guard.engine.release import ReleaseCheckResult, _pytest_basetemp
 
@@ -62,7 +63,7 @@ def test_all_release_version_surfaces_match_exact_semver() -> None:
         str(plugin["version"]),
         changelog.group(1) if changelog else "",
     }
-    assert versions == {"3.3.4"}
+    assert versions == {"4.0.0"}
     assert any(
         str(dependency).lower().startswith("pyyaml")
         for dependency in project["project"]["dependencies"]

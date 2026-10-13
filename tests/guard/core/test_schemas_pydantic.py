@@ -1,9 +1,12 @@
 """Unit tests for Pydantic v2 schemas and validation models in plugins/violin_guard/schemas.py."""
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
 from plugins.violin_guard.core import schemas
+from plugins.violin_guard.registry import TOOL_DEFINITIONS, _validated_handler
 
 
 def test_exec_args_model_timeout_bounds():
@@ -77,35 +80,109 @@ def test_record_hypothesis_normalises_variant_vuln_class():
     assert model.vuln_class == "idor"
 
 
-def test_record_hypothesis_rejects_unknown_vuln_class_with_valid_list():
-    with pytest.raises(ValidationError, match="unknown vuln_class.*valid classes are"):
-        schemas.validate_args(
+def test_record_hypothesis_normalizes_human_readable_vuln_classes():
+    for value, expected in (
+        ("Mass assignment", "mass-assignment"),
+        ("Missing authentication", "missing-authentication"),
+        ("IDOR access control", "idor-access-control"),
+    ):
+        model = schemas.validate_args(
             schemas.RecordHypothesisArgsModel,
-            {"eng_dir": "/tmp/eng", "vuln_class": "Mass assignment"},
+            {"eng_dir": "/tmp/eng", "vuln_class": value},
         )
+        assert model.vuln_class == expected
 
 
 @pytest.mark.parametrize(
-    "model_type,required,default_status",
+    ("value", "expected"),
     [
-        (
-            schemas.RecordPttArgsModel,
-            {"eng_dir": "eng", "id": "PT-001", "skill": "pentest", "technique": "recon"},
-            "",
-        ),
-        (
-            schemas.ReviewBatchArgsModel,
-            {"eng_dir": "eng", "id": "PT-001", "note": "reviewed"},
-            "[~]",
-        ),
+        ("mass-assignmnt", "mass-assignment"),
+        ("missing-auth", "missing-authentication"),
+        ("xss-bypass", "xss"),
     ],
 )
-def test_review_payload_contract(model_type, required, default_status):
+def test_record_hypothesis_rejects_unknown_vuln_class_with_suggestion(value: str, expected: str):
+    with pytest.raises(ValidationError) as exc:
+        schemas.validate_args(
+            schemas.RecordHypothesisArgsModel,
+            {"eng_dir": "/tmp/eng", "vuln_class": value},
+        )
+    message = str(exc.value)
+    assert f"Did you mean '{expected}'?" in message
+    assert message.index("Did you mean") < message.index("Valid classes are")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_suggestion"),
+    (
+        ("bogus-class", None),
+        ("Default/weak credentials", "default-credentials"),
+        ("bogus-injection", None),
+    ),
+)
+def test_record_hypothesis_rejects_unknown_vuln_class_with_appropriate_suggestion(
+    value: str, expected_suggestion: str | None
+):
+    with pytest.raises(ValidationError) as exc:
+        schemas.validate_args(
+            schemas.RecordHypothesisArgsModel,
+            {"eng_dir": "/tmp/eng", "vuln_class": value},
+        )
+    message = str(exc.value)
+    assert "unknown vuln_class" in message
+    assert "Valid classes are" in message
+    if expected_suggestion is None:
+        assert "Did you mean" not in message
+    else:
+        assert f"Did you mean '{expected_suggestion}'?" in message
+
+
+def test_record_hypothesis_accepts_coverage_table_vuln_class_names():
+    for name in (
+        "default-credentials",
+        "idor-access-control",
+        "jwt-attacks",
+        "workflow-state-abuse",
+    ):
+        model = schemas.validate_args(
+            schemas.RecordHypothesisArgsModel,
+            {"eng_dir": "/tmp/eng", "vuln_class": name},
+        )
+        assert model.vuln_class == name
+
+
+def test_record_hypothesis_publishes_the_vuln_class_enum():
+    description = schemas.RecordHypothesisArgsModel.model_fields["vuln_class"].description or ""
+    assert "idor" in description and "sqli" in description
+    assert "mass-assignment" in description
+    assert "missing-authentication" in description
+    source_description = (
+        schemas.RecordHypothesisArgsModel.model_fields["candidate_source"].description or ""
+    )
+    assert "api-enumeration" in source_description
+    assert "api-enumeration is a technique-as-source alias for api-testing" in source_description
+
+
+def test_record_hypothesis_accepts_evidence_paths_and_merges_runtime_evidence():
+    model = schemas.validate_args(
+        schemas.RecordHypothesisArgsModel,
+        {
+            "eng_dir": "/tmp/eng",
+            "runtime_evidence": "evidence/recon/a.txt",
+            "evidence_paths": ["evidence/recon/b.txt", "evidence/recon/a.txt"],
+        },
+    )
+    assert model.evidence_paths == ["evidence/recon/b.txt", "evidence/recon/a.txt"]
+    assert model.runtime_evidence == "evidence/recon/a.txt, evidence/recon/b.txt"
+
+
+def test_review_payload_contract():
+    model_type = schemas.ReviewBatchArgsModel
+    required = {"eng_dir": "eng", "id": "PT-001", "note": "reviewed"}
     first = model_type.model_validate(required)
     second = model_type.model_validate(required)
-    assert first.status == default_status
+    assert first.status == "[~]"
     assert first.outcome == first.next_action == first.next_technique == ""
-    assert first.research_attempted is False
     first.evidence_paths.append("evidence/recon/result.txt")
     assert second.evidence_paths == []
     payload = {
@@ -114,12 +191,13 @@ def test_review_payload_contract(model_type, required, default_status):
         "evidence_paths": ["evidence/recon/result.txt"],
         "next_action": "continue",
         "next_technique": "inspect",
-        "research_attempted": True,
     }
     output = model_type.model_validate(payload).model_dump()
     assert all(output[key] == value for key, value in payload.items())
     with pytest.raises(ValidationError, match="extra_forbidden"):
         model_type.model_validate({**required, "unexpected": True})
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        model_type.model_validate({**required, "research_attempted": True})
     with pytest.raises(ValidationError):
         model_type.model_validate({**required, "evidence_paths": "not-a-list"})
     for key in required:
@@ -127,6 +205,56 @@ def test_review_payload_contract(model_type, required, default_status):
             model_type.model_validate(
                 {name: value for name, value in required.items() if name != key}
             )
+
+
+def test_ptt_payload_rejects_batch_review_fields():
+    required = {
+        "eng_dir": "eng",
+        "id": "PT-001",
+        "skill": "pentest",
+        "technique": "recon",
+        "note": "started",
+    }
+    model = schemas.RecordPttArgsModel.model_validate(required)
+    assert model.status == ""
+    for field in (
+        "outcome",
+        "evidence_paths",
+        "next_action",
+        "next_technique",
+        "research_attempted",
+    ):
+        with pytest.raises(ValidationError, match="extra_forbidden"):
+            schemas.RecordPttArgsModel.model_validate({**required, field: "ignored"})
+
+
+@pytest.mark.parametrize(
+    "tool_name,field",
+    [
+        *(
+            ("violin_record_ptt", field)
+            for field in (
+                "outcome",
+                "evidence_paths",
+                "next_action",
+                "next_technique",
+                "research_attempted",
+            )
+        ),
+        ("violin_review_batch", "research_attempted"),
+    ],
+)
+def test_removed_review_fields_are_absent_from_registered_schema_and_rejected(tool_name, field):
+    definition = next(item for item in TOOL_DEFINITIONS if item.name == tool_name)
+    assert field not in definition.schema["parameters"]["properties"]
+    required = (
+        {"eng_dir": "eng", "id": "PT-001", "skill": "pentest", "technique": "recon"}
+        if tool_name == "violin_record_ptt"
+        else {"eng_dir": "eng", "id": "PT-001", "note": "reviewed"}
+    )
+    response = json.loads(_validated_handler(definition)({**required, field: True}))
+    assert response["status"] == "invalid_arguments"
+    assert any(error["type"] == "extra_forbidden" for error in response["errors"])
 
 
 def test_exec_burst_publishes_the_session_binding_rule():

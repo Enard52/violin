@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..core import findings
+from ..core.evidence import findings
 from .base import _json, _serialize_errors
 
 
@@ -21,6 +21,7 @@ def handle_submit_finding(args: dict, **kwargs) -> str:
         "ok",
         finding_id=result["finding_id"],
         status=result["status"],
+        claim_validation="not_assessed",
         duplicate=result["duplicate"],
         receipt_validation=result["receipt_validation"],
         evidence_complete=not warnings,

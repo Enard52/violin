@@ -8,14 +8,14 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from .core import ptt, state
-from .core.skill_receipts import (
+from .core.engagement import ptt, state
+from .core.skills.skill_receipts import (
     advance_context_generation,
     binding_readiness,
     record_binding_turn,
     record_delivery_turn,
 )
-from .gates import code_execution_audit
+from .engine import code_execution_audit
 from .gates.terminal_policy import block_terminal_command
 
 _SESSION_ENGAGEMENTS: dict[str, str] = {}
@@ -169,16 +169,15 @@ def _post_tool_call_hook(
             raise ValueError("execute_code completion is missing Hermes tool_call_id")
         session_id = str(kwargs.get("session_id") or "")
         with _EXECUTE_CODE_RECEIPTS_LOCK:
-            pending = _EXECUTE_CODE_RECEIPTS.get(tool_call_id)
+            pending = _EXECUTE_CODE_RECEIPTS.pop(tool_call_id, None)
             if pending is None:
                 raise ValueError("execute_code intent receipt is missing for tool_call_id")
             receipt_session, receipt = pending
+        try:
             if session_id and receipt_session and session_id != receipt_session:
                 raise ValueError(
                     "execute_code completion session does not match its intent receipt"
                 )
-            _EXECUTE_CODE_RECEIPTS.pop(tool_call_id)
-        try:
             code_execution_audit.record_completion(
                 args.get("code"), result, duration_ms, receipt_path=receipt
             )

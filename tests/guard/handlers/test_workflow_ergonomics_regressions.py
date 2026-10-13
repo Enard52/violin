@@ -5,12 +5,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from plugins.violin_guard import handlers as service
-from plugins.violin_guard.core import bootstrap, hypotheses, ptt, state
-from plugins.violin_guard.core.history import append_history, check_history_staleness
-from plugins.violin_guard.core.phases import Phase
-from plugins.violin_guard.core.skill_receipts import SkillViewResult
-from plugins.violin_guard.core.targets import check_scope_targets
+from plugins.violin_guard.core.commands.targets import check_scope_targets
+from plugins.violin_guard.core.engagement import bootstrap, hypotheses, ptt, state
+from plugins.violin_guard.core.engagement.phases import Phase
+from plugins.violin_guard.core.evidence.history import append_history, check_history_staleness
+from plugins.violin_guard.core.skills.skill_receipts import (
+    SkillViewResult,
+    get_binding,
+    get_delivery,
+    skill_content_digest,
+)
 from plugins.violin_guard.engine import execution
 from plugins.violin_guard.gates import command
 from plugins.violin_guard.gates.command import (
@@ -111,6 +118,23 @@ def test_missing_scope_blocks_targeted_but_not_untargeted_hypotheses(tmp_path: P
     assert allowed["status"] == "ok"
 
 
+def test_hypothesis_research_flag_still_records_a_research_attempt(tmp_path: Path) -> None:
+    eng = _engagement(tmp_path)
+    result = json.loads(
+        service.handle_record_hypothesis(
+            {
+                "eng_dir": str(eng),
+                "id": "002",
+                "title": "Review prior work",
+                "research_attempted": True,
+            }
+        )
+    )
+    assert result["status"] == "ok"
+    progress = state.read_json(eng / "state" / "semantic-progress.json")
+    assert progress["research_attempts"][-1]["tool"] == "hypothesis_research"
+
+
 def test_wildcard_scope_allows_subdomains(tmp_path: Path) -> None:
     scope = tmp_path / "scope.yaml"
     scope.write_text("targets:\n  domains: ['*.example.test']\n", encoding="utf-8")
@@ -173,6 +197,13 @@ def test_ptt_heading_parenthetical_and_explicit_task_create_close(
         )
     )
     assert created["task_created"] is True
+    binding = get_binding(eng, "PT-900")
+    assert binding is not None
+    digest = skill_content_digest("skill")
+    assert binding["content_digest"] == digest
+    delivery = get_delivery(eng, binding["delivery_id"])
+    assert delivery["content_digest"] == digest
+    assert f"[skill:pentest@{digest}]" in ptt_path.read_text(encoding="utf-8")
     # A fresh session must prepare again; do not rely on cross-task reuse here.
     state.record_session_id(eng, "close-session")
     close_args = {
@@ -239,13 +270,30 @@ def test_pending_batch_repeat_is_allowed_for_recovery(tmp_path: Path) -> None:
     assert any("pending batch" in info for info in infos)
 
 
-def test_burst_continues_past_review_required_command(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("yolo_mode", [None, "0", "1"])
+@pytest.mark.parametrize("review_index", [0, 1])
+def test_burst_requires_authorization_before_any_execution(
+    tmp_path: Path, monkeypatch, yolo_mode, review_index
+) -> None:
+    if yolo_mode is None:
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_YOLO_MODE", yolo_mode)
     eng = _engagement(tmp_path)
-    checks = iter((CheckResult(warnings=["review first"]), CheckResult()))
+    results = [CheckResult(), CheckResult()]
+    results[review_index] = CheckResult(warnings=["review first"])
+    checks = iter(results)
     from plugins.violin_guard.handlers import exec_handlers
 
     monkeypatch.setattr(exec_handlers, "_check_command_internal", lambda _args: next(checks))
     executed: list[str] = []
+    reservations: list[int] = []
+
+    def reserve_credit(eng_dir, phase, count):
+        reservations.append(count)
+        return None
+
+    monkeypatch.setattr(state, "reserve_sync_credit", reserve_credit)
 
     def fake_execute(command: str, **_kwargs):
         executed.append(command)
@@ -262,6 +310,15 @@ def test_burst_continues_past_review_required_command(tmp_path: Path, monkeypatc
             }
         )
     )
-    assert data["status"] == "batch_complete"
-    assert data["review_required"] is True
-    assert executed == ["first", "second"]
+    if yolo_mode == "1":
+        assert data["status"] == "batch_complete"
+        assert data["review_required"] is True
+        assert executed == ["first", "second"]
+        assert reservations == [2]
+    else:
+        assert data["status"] == "denied"
+        assert data["executed"] == 0
+        assert data["results"][0]["index"] == review_index + 1
+        assert data["results"][0]["warnings"] == ["review first"]
+        assert executed == []
+        assert reservations == []

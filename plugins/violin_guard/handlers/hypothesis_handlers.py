@@ -2,20 +2,29 @@
 
 from __future__ import annotations
 
-from ..core import hypotheses, state
-from ..core.targets import scope_hosts
+from ..core.commands.targets import _host_in_scope_data, normalize_target, scope_hosts
+from ..core.engagement import hypotheses, state
 from ..gates.scope_gate import load_scope
 from .base import _eng_path, _json, _serialize_errors
 
 
 def _scope_hosts(eng_dir: str, target: str) -> set[str] | None:
-    """Return canonical scope hosts, requiring a valid scope for targeted records."""
+    """Return canonical scope hosts, requiring a valid scope for targeted records.
+
+    A targeted hypothesis may name a host that is covered only by a CIDR or
+    range; that host is added to the set so the membership check accepts it.
+    """
     scope_path = _eng_path(eng_dir) / "scope" / "scope.yaml"
     if not scope_path.exists():
         if target.strip():
             raise ValueError("targeted hypotheses require a valid scope/scope.yaml")
         return None
-    return scope_hosts(load_scope(scope_path))
+    scope = load_scope(scope_path)
+    hosts = scope_hosts(scope)
+    normalized = normalize_target(target) if target.strip() else ""
+    if normalized and _host_in_scope_data(scope, normalized):
+        hosts.add(normalized)
+    return hosts
 
 
 @_serialize_errors

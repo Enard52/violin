@@ -1,6 +1,6 @@
 """Tests for automatic HTTP status-line capture in evidence-producing probes."""
 
-from plugins.violin_guard.core.http_proof import normalize_http_proof_flags
+from plugins.violin_guard.core.commands.http_proof import normalize_http_proof_flags
 
 
 def test_injects_i_into_plain_curl_get():
@@ -46,6 +46,19 @@ def test_leaves_none_curl_untouched():
 def test_adds_status_capture_to_redirected_body():
     cmd = "curl -sS --max-time 30 https://duck-store.escape.tech/ > /tmp/out.txt"
     assert normalize_http_proof_flags(cmd).startswith("curl -i -sS")
+
+
+def test_injects_status_to_stdout_when_curl_writes_body_file():
+    cmd = "curl -sS -o body.json https://duck-store.escape.tech/api/v1/users/ && python3 parse.py body.json"
+    out = normalize_http_proof_flags(cmd)
+    assert "-w 'HTTP %{http_code}\\n'" in out
+    assert "curl -i" not in out
+    assert out.endswith("&& python3 parse.py body.json")
+
+
+def test_injects_status_for_long_output_flag():
+    cmd = "curl --output=body.json -sS https://duck-store.escape.tech/api/v1/users/"
+    assert "-w 'HTTP %{http_code}\\n'" in normalize_http_proof_flags(cmd)
 
 
 def test_injects_i_for_wget_too():
@@ -94,10 +107,12 @@ def test_leaves_xargs_wrapped_probe_untouched():
     assert normalize_http_proof_flags(cmd) == cmd
 
 
-def test_injects_i_for_probe_followed_by_logical_and():
-    """``&&`` is not a pipe: the probe's stdout is still what the receipt holds."""
+def test_injects_status_for_probe_followed_by_logical_and():
+    """The response file remains a body, while stdout records the status."""
     cmd = "curl -sS -o body.txt https://duck-store.escape.tech/ && wc -c body.txt"
-    assert "curl -i" in normalize_http_proof_flags(cmd)
+    out = normalize_http_proof_flags(cmd)
+    assert "-w 'HTTP %{http_code}\\n'" in out
+    assert "curl -i" not in out
 
 
 def test_preserves_quoted_url_fragments():

@@ -1,0 +1,323 @@
+"""Receipt-backed structured findings and deterministic report rendering."""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Collection
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from ...core import schemas
+from ...core.engagement import state
+from ...core.evidence import receipt_integrity
+from ..results import GuardResult
+from . import finding_reports
+
+FINDINGS_PATH = Path("evidence/findings.jsonl")
+
+
+def _store_path(engagement: Path) -> Path:
+    return engagement / FINDINGS_PATH
+
+
+def _identity(title: str) -> str:
+    """One finding per vulnerability: a claim's title is its identity.
+
+    The evidence set is deliberately not part of the identity, so attaching a
+    stronger proof to a claim updates that claim instead of filing a second one.
+    """
+    return title.strip().casefold()
+
+
+def load_findings(eng_dir: str | Path) -> list[dict[str, Any]]:
+    """Load one canonical record per vulnerability for an engagement."""
+    engagement = state.resolve_eng_dir(eng_dir)
+    path = _store_path(engagement)
+    if not path.is_file():
+        return []
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{FINDINGS_PATH}:{line_number}: invalid JSON") from exc
+        try:
+            record = schemas.FindingRecordModel.model_validate(value).model_dump()
+        except ValueError as exc:
+            raise ValueError(f"{FINDINGS_PATH}:{line_number}: invalid finding record") from exc
+        identity = _identity(str(record.get("title") or ""))
+        if identity in seen:
+            continue  # a duplicate written before the store became one record per vulnerability
+        seen.add(identity)
+        records.append(record)
+    return records
+
+
+def _next_finding_id(records: list[dict[str, Any]]) -> str:
+    numbers = [
+        int(value.removeprefix("FIND-"))
+        for record in records
+        if (value := str(record.get("finding_id") or "")).startswith("FIND-")
+        and value.removeprefix("FIND-").isdigit()
+    ]
+    return f"FIND-{max(numbers, default=0) + 1:03d}"
+
+
+def _stale_evidence_error(paths: Collection[str]) -> ValueError:
+    """Explain that cited evidence no longer matches the receipt that sealed it."""
+    return ValueError(
+        f"has changed evidence: {', '.join(paths)} no longer matches the digest "
+        "in this receipt (the bytes changed, the file was removed, or it is not a "
+        "regular file). Existing signatures are preserved; re-run the probe to "
+        "produce evidence and a receipt that authenticate the current bytes."
+    )
+
+
+def _verified_receipt(
+    engagement: Path, receipt_path: str
+) -> tuple[dict[str, Any], receipt_integrity.EvidenceState]:
+    relative = Path(receipt_path)
+    expected_root = (engagement / "evidence" / "executions").resolve()
+    candidate = (engagement / relative).resolve()
+    if (
+        relative.is_absolute()
+        or not candidate.is_relative_to(expected_root)
+        or candidate.suffix.lower() != ".json"
+        or not candidate.is_file()
+        or candidate.is_symlink()
+    ):
+        raise ValueError("receipt_paths must name execution JSON files beneath evidence/executions")
+    receipt = state.read_json(candidate)
+    evidence = receipt_integrity.verify_runtime_receipt(receipt, engagement)
+    if receipt.get("status") not in {
+        "completed",
+        "completed_with_error",
+        "timed_out",
+        "output_limited",
+    }:
+        raise ValueError(f"receipt did not execute to a reviewable result: {receipt_path}")
+    if receipt.get("exit_code") is None:
+        raise ValueError(f"receipt has no exit status: {receipt_path}")
+    if not evidence.authenticated:
+        if evidence.stale:
+            raise _stale_evidence_error(evidence.stale)
+        raise ValueError(f"receipt contains no authenticated evidence: {receipt_path}")
+    return receipt, evidence
+
+
+def _verified_evidence_files(
+    engagement: Path,
+    evidence_paths: list[str],
+    authenticated_paths: set[str],
+    stale_paths: Collection[str] = (),
+) -> list[str]:
+    """Resolve decisive-evidence files authenticated by the cited receipts."""
+    valid: list[str] = []
+    evidence_root = (engagement / "evidence").resolve()
+    receipt_root = (evidence_root / "executions").resolve()
+    for value in dict.fromkeys(evidence_paths):
+        relative = Path(str(value).strip())
+        candidate = (engagement / relative).resolve()
+        if (
+            not str(value).strip()
+            or relative.is_absolute()
+            or not candidate.is_relative_to(evidence_root)
+            or candidate.is_symlink()
+            or not candidate.is_file()
+            or candidate.stat().st_size == 0
+        ):
+            raise ValueError("evidence_paths must name non-empty files beneath evidence/")
+        if candidate.is_relative_to(receipt_root) and candidate.suffix.lower() == ".json":
+            raise ValueError(
+                "execution receipts are not decisive evidence; cite them via receipt_paths"
+            )
+        normalized = candidate.relative_to(engagement).as_posix()
+        if normalized not in authenticated_paths:
+            if normalized in stale_paths:
+                raise _stale_evidence_error([normalized])
+            raise ValueError(
+                "evidence_paths must be authenticated by an execution receipt cited in "
+                f"receipt_paths; unbound evidence: {normalized!r}; include the receipt that sealed this file"
+            )
+        valid.append(normalized)
+    return valid
+
+
+_STATUS_LINE_RE = re.compile(rb"HTTP/\d[\x20-\x7e]*", re.I)
+_HEADER_LINE_RE = re.compile(rb"[A-Za-z][A-Za-z0-9-]*:[ \t]*\S")
+_LABEL_LINE_RE = re.compile(rb"^\s*={2,}.*={2,}\s*$", re.M)
+
+
+def _head_has_http_bytes(head: bytes) -> bool:
+    """True when decisive HTTP response bytes follow the last status line.
+
+    Status-only captures (e.g. a probe closed with ``grep '^HTTP'``) prove the
+    request happened but carry no response content: after the last status line
+    there are only further status lines, ``=== label ===`` echo markers, and
+    whitespace. Real proof shows a header line (``name: value``) or body bytes.
+    """
+    matches = list(_STATUS_LINE_RE.finditer(head))
+    if not matches:
+        return False
+    tail = head[matches[-1].end() :]
+    if _HEADER_LINE_RE.search(tail):
+        return True
+    cleaned = _LABEL_LINE_RE.sub(b"", tail)
+    cleaned = _STATUS_LINE_RE.sub(b"", cleaned)
+    return bool(re.sub(rb"[\s\x00-\x1f]+", b"", cleaned))
+
+
+def _proof_byte_warnings(
+    engagement: Path,
+    verified_paths: list[str],
+    saved_evidence: list[str],
+) -> list[str]:
+    """Warn (never block) when a finding's proof chain lacks HTTP response bytes.
+
+    A receipt whose stdout shows only status lines proves the request happened
+    but carries no response content. Attaching the saved probe file via
+    ``evidence_paths`` restores the decisive bytes to the proof chain.
+    """
+    for relative in [*verified_paths, *saved_evidence]:
+        path = engagement / relative
+        try:
+            with path.open("rb") as handle:
+                head = handle.read(4096)
+        except OSError:
+            continue
+        if _head_has_http_bytes(head):
+            return []
+    return [
+        "finding proof carries no literal HTTP response bytes, but it is still "
+        "accepted as proof - this warning does not block submission. Attach the "
+        "decisive evidence file(s) via evidence_paths, or re-run the probe through "
+        "violin_exec (which injects the status-capture flag -i) and cite that "
+        "receipt so the decisive status line is captured"
+    ]
+
+
+def submit_finding(
+    eng_dir: str | Path,
+    *,
+    title: str,
+    severity: str,
+    summary: str,
+    receipt_paths: list[str],
+    evidence_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Persist one engagement finding with authenticated execution evidence."""
+    engagement = state.resolve_eng_dir(eng_dir)
+    normalized_receipts = list(
+        dict.fromkeys(value.strip() for value in receipt_paths if value.strip())
+    )
+    verified_paths: list[str] = []
+    stale_paths: set[str] = set()
+    execution_ids: list[str] = []
+    for receipt_path in normalized_receipts:
+        receipt, evidence = _verified_receipt(engagement, receipt_path)
+        execution_ids.append(str(receipt.get("execution_id") or ""))
+        verified_paths.extend(
+            path.relative_to(engagement).as_posix() for path in evidence.authenticated
+        )
+        stale_paths.update(evidence.stale)
+
+    evidence_paths = evidence_paths or []
+    saved_evidence = _verified_evidence_files(
+        engagement,
+        evidence_paths,
+        set(verified_paths),
+        stale_paths,
+    )
+
+    store = _store_path(engagement)
+    with state.workflow_lock(engagement), state.lock_file(store):
+        records = load_findings(engagement)
+        index = next(
+            (
+                position
+                for position, stored in enumerate(records)
+                if _identity(str(stored.get("title") or "")) == _identity(title)
+            ),
+            None,
+        )
+        previous = records[index] if index is not None else {}
+        record = {
+            "schema_version": 1,
+            "finding_id": previous.get("finding_id") or _next_finding_id(records),
+            "title": title.strip(),
+            "severity": severity,
+            "summary": summary.strip(),
+            "status": "validated",
+            "receipt_paths": list(
+                dict.fromkeys([*previous.get("receipt_paths", ()), *normalized_receipts])
+            ),
+            "evidence_paths": list(
+                dict.fromkeys([*previous.get("evidence_paths", ()), *saved_evidence])
+            ),
+            "execution_ids": list(
+                dict.fromkeys([*previous.get("execution_ids", ()), *execution_ids])
+            ),
+            "created_at": previous.get("created_at") or datetime.now(UTC).isoformat(),
+            "engagement_id": engagement.name,
+        }
+        record = schemas.FindingRecordModel.model_validate(record).model_dump()
+        if index is None:
+            records.append(record)
+        else:
+            records[index] = record
+        state.ensure_dir(store.parent)
+        state.atomic_text(
+            store,
+            "".join(
+                json.dumps(stored, ensure_ascii=False, sort_keys=True) + "\n" for stored in records
+            ),
+        )
+        return {
+            **record,
+            "duplicate": index is not None,
+            "receipt_validation": "verified",
+            "warnings": _proof_byte_warnings(engagement, verified_paths, record["evidence_paths"]),
+        }
+
+
+def generate_findings_yaml(eng_dir: str | Path, *, force: bool = False) -> Path:
+    engagement = state.resolve_eng_dir(eng_dir)
+    return finding_reports.generate_findings_yaml(
+        engagement, load_findings(engagement), force=force
+    )
+
+
+def generate_report_md(eng_dir: str | Path, *, target: str, force: bool = False) -> Path:
+    engagement = state.resolve_eng_dir(eng_dir)
+    return finding_reports.generate_report_md(
+        engagement, load_findings(engagement), target=target, force=force
+    )
+
+
+def generate_closeout(eng_dir: str | Path, *, target: str, force: bool = False) -> GuardResult:
+    """Generate both closeout artifacts with the existing CLI result contract."""
+    result = GuardResult()
+    try:
+        yaml_path = generate_findings_yaml(eng_dir, force=force)
+        report_path = generate_report_md(eng_dir, target=target, force=force)
+    except ValueError as exc:
+        result.add_error(str(exc))
+        return result
+    result.add_info(f"wrote {yaml_path}")
+    result.add_info(f"wrote {report_path}")
+    return result
+
+
+__all__ = [
+    "generate_closeout",
+    "FINDINGS_PATH",
+    "generate_findings_yaml",
+    "generate_report_md",
+    "load_findings",
+    "submit_finding",
+]

@@ -3,10 +3,10 @@ import json
 import pytest
 
 from plugins.violin_guard import handlers as service
-from plugins.violin_guard.core import ptt, state
-from plugins.violin_guard.core.skill_receipts import SkillViewResult
+from plugins.violin_guard.core.engagement import ptt, state
+from plugins.violin_guard.core.skills.skill_receipts import SkillViewResult
 from plugins.violin_guard.handlers import ptt_handlers
-from tests.guard.receipt_fixture import bind_active_task
+from tests.guard.receipt_fixture import bind_active_task, record_started_command
 
 _SCOPE_YAML = """targets:
   ip_addresses: ["10.129.2.5"]
@@ -41,14 +41,18 @@ def ctf_eng(tmp_path):
 
     (scope_dir / "scope.yaml").write_text(_SCOPE_YAML, encoding="utf-8")
     (state_dir / "history.md").write_text("# History\n", encoding="utf-8")
-    (state_dir / "hypotheses.md").write_text("# Hypotheses\n", encoding="utf-8")
+    (eng / "hypotheses.md").write_text("# Hypotheses\n\n## Active Theories\n\n", encoding="utf-8")
 
     ptt_content = """# Pentesting Task Tree
 
 ## Phase: RECON
+| ID | Status | Task | Notes |
+|---|---|---|---|
 | PT-001 | [~] | Recon target service | initial note |
 
 ## Phase: EXPLOITATION
+| ID | Status | Task | Notes |
+|---|---|---|---|
 | PT-002 | [ ] | Exploit Cobbler CVE-2024-47533 | initial note |
 """
     (state_dir / "ptt.md").write_text(ptt_content, encoding="utf-8")
@@ -115,8 +119,8 @@ def test_semantic_lock_requires_research_plus_meaningful_pivot(ctf_eng):
 def test_batch_review_with_running_background_tunnel(ctf_eng):
     """Verify reviewing a batch with a still-running background command succeeds."""
     bind_active_task(ctf_eng)
-    state.mark_pending_sync(
-        ctf_eng, "ssh -f -N -L 8080:127.0.0.1:80 user@10.129.2.5", "RECON", "PT-001"
+    record_started_command(
+        ctf_eng, "ssh -f -N -L 8080:127.0.0.1:80 user@10.129.2.5", task_id="PT-001"
     )
 
     # Create background execution receipt
@@ -156,6 +160,11 @@ def test_batch_review_with_running_background_tunnel(ctf_eng):
 
 def test_stale_active_ptt_task_auto_superseded(ctf_eng, monkeypatch):
     """Verify starting a new task when no pending batch exists auto-supersedes the prior task."""
+    (ctf_eng / "hypotheses.md").write_text(
+        "# Hypotheses\n\n## Active Theories\n\n### H-001: Service exploit candidate\n"
+        "- Status: Candidate\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(
         ptt_handlers.HermesSkillViewAdapter,
         "view",
@@ -233,7 +242,7 @@ def test_invalid_ptt_start_status_error_message(ctf_eng):
 
 def test_parse_target_token_ipv6_url():
     """Verify targets._parse_target_token correctly extracts IPv6 address from URL."""
-    from plugins.violin_guard.core import targets
+    from plugins.violin_guard.core.commands import targets
 
     res = targets._parse_target_token("http://[2001:db8::1]:8080/api")
     assert res == "2001:db8::1"
@@ -241,7 +250,7 @@ def test_parse_target_token_ipv6_url():
 
 def test_update_hypothesis_merge_existing_fields(ctf_eng):
     """Verify update_hypothesis preserves existing runtime_evidence during partial field update."""
-    from plugins.violin_guard.core import hypotheses
+    from plugins.violin_guard.core.engagement import hypotheses
 
     h_file = ctf_eng / "hypotheses.md"
     evidence = ctf_eng / "evidence" / "executions" / "1.json"
