@@ -213,9 +213,8 @@ def test_cli_module_entry_points(module):
 def test_project_imports_diagnostic_message(tmp_path: Path) -> None:
     from scripts.cli_environment import project_imports
 
-    with pytest.raises(SystemExit) as exc_info:
-        with project_imports(tmp_path):
-            raise ImportError("No module named 'yaml'", name="yaml")
+    with pytest.raises(SystemExit) as exc_info, project_imports(tmp_path):
+        raise ImportError("No module named 'yaml'", name="yaml")
 
     message = str(exc_info.value)
     assert message.startswith("Cannot import a Violin dependency: No module named 'yaml'\n")
@@ -225,6 +224,7 @@ def test_project_imports_diagnostic_message(tmp_path: Path) -> None:
 
 def test_ensure_venv_diagnostic_message(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import builtins
+
     from scripts.cli_environment import ensure_venv
 
     orig_import = builtins.__import__
